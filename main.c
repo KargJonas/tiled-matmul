@@ -14,12 +14,28 @@ static inline float* pad_mat(float* src, size_t srcr, size_t srcc, size_t padr, 
 static inline float* pad_t_mat(float* src, size_t srcr, size_t srcc, size_t padr, size_t padc);
 static inline float* unpad_mat(float* src, float* dst, size_t r, size_t c, size_t padr, size_t padc);
 
-int main() {
-    srand(314);
+int parse_int(const char *str) {
+    char *end;
+    long val = strtol(str, &end, 10);
+    if (*end || str == end) {
+        fprintf(stderr, "Invalid integer: '%s'\n", str);
+        exit(1);
+    }
+    return (int)val;
+}
 
-    size_t m = 3000;
-    size_t n = 3000;
-    size_t p = 3000;
+int main(int argc, char* argv[]) {
+    srand(314);
+    // srand(time(NULL));
+
+    if (argc != 4) {
+        fprintf(stderr, "Error: Expected 3 arguments.");
+        return 1;
+    }
+
+    size_t m = parse_int(argv[1]);
+    size_t n = parse_int(argv[2]);
+    size_t p = parse_int(argv[3]);
 
     float* A = malloc(m * n * sizeof(float));
     float* B = malloc(n * p * sizeof(float));
@@ -42,7 +58,7 @@ int main() {
     // print_mat(B, n, p);
 
     double avg = 0;
-    int iterations = 10;
+    int iterations = 1;
     for (int i = 0; i < iterations; i++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -52,10 +68,11 @@ int main() {
         double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         avg += elapsed;
     }
-
+ 
     avg /= iterations;
 
-    printf("Time elapsed: %.9f seconds\n", avg);
+    // printf("Time elapsed: %.9f seconds\n", avg);
+    printf("%.9f", avg);
 
     unpad_mat(padC, C, m, p, padm, padp);
 

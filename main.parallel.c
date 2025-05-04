@@ -8,7 +8,9 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#define TILE_SIZE 2
+// #define VERBOSE
+
+#define TILE_SIZE 64
 #define N_CORES   12
 #define ALIGN_UP(x) (((x) + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE)
 
@@ -86,11 +88,11 @@ void* worker_thread(void* arg) {
         
         // Execute the task
         mm_tile(task);
-        free(task);
-        
+        free(task);        
         // Decrement the task counter and signal if all tasks are done
         pthread_mutex_lock(&pool->completion_lock);
         pool->tasks_remaining--;
+        
         if (pool->tasks_remaining == 0) {
             pthread_cond_broadcast(&pool->all_tasks_done);
         }
@@ -135,7 +137,7 @@ void enqueue(threadpool_t *pool, task_t *task) {
     node->tile_task = task;
     node->next = NULL;
 
-    pthread_mutex_lock(&pool->lock);
+    pthread_mutex_lock(&pool->completion_lock);
     
     pool->tasks_remaining++;
 
@@ -145,7 +147,7 @@ void enqueue(threadpool_t *pool, task_t *task) {
     pool->tail = node;
 
     pthread_cond_signal(&pool->not_empty); // Signal waiting threads
-    pthread_mutex_unlock(&pool->lock);
+    pthread_mutex_unlock(&pool->completion_lock);
 }
 
 task_t* dequeue(threadpool_t *pool) {
@@ -211,8 +213,8 @@ int parse_int(const char *str) {
 }
 
 int main(int argc, char* argv[]) {
-    // srand(314);
-    srand(time(NULL));
+    srand(314);
+    // srand(time(NULL));
 
     if (argc != 4) {
         fprintf(stderr, "Error: Expected 3 arguments.");
@@ -245,8 +247,10 @@ int main(int argc, char* argv[]) {
     float* padB = pad_t_mat(B, n, p, padn, padp);
     float* padC = calloc(padm * padp, sizeof(float));
 
+    #ifdef VERBOSE
     print_mat(A, m, n);
     print_mat(B, n, p);
+    #endif
 
     double avg = 0;
     int iterations = 1;
@@ -263,15 +267,17 @@ int main(int argc, char* argv[]) {
     avg /= iterations;
 
     // printf("Time elapsed: %.9f seconds\n", avg);
+    printf("%.9f", avg);
 
     unpad_mat(padC, C, m, p, padm, padp);
     
-
     free(padA);
     free(padB);
     free(padC);
 
+    #ifdef VERBOSE
     print_mat(C, m, p);
+    #endif
 
     free(A);
     free(B);
@@ -286,22 +292,6 @@ int main(int argc, char* argv[]) {
 // A, B and C are references to the beginning of the current tile.
 // The strides tell us how many elements to step over to get to
 // the next row in that tile.
-// static inline __attribute__((always_inline)) void mm_tile(task_t* task) {
-//     for (size_t i = 0; i < TILE_SIZE; i++) {
-//         size_t ic = i * task->stride_c;
-//         size_t ia = i * task->stride_a;
-
-//         for (size_t j = 0; j < TILE_SIZE; j++) {
-//             size_t ic_j = ic + j;
-//             size_t ib_j = j * task->stride_b;
-
-//             for (size_t k = 0; k < TILE_SIZE; k++) {
-//                 task->C[ic_j] += task->A[ia + k] * task->B[ib_j + k];
-//             }
-//         }
-//     }
-// }
-
 static inline __attribute__((always_inline)) void mm_tile(task_t* task) {
     for (size_t ti = 0; ti < TILE_SIZE; ++ti) {
         size_t offA = ti * task->stride_a;
@@ -330,26 +320,22 @@ void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t
     const size_t padn = ALIGN_UP(n);
     const size_t padp = ALIGN_UP(p);
 
-    // Iterate over all inner tiles
+    // Enqueue one task per (i,j) tile
     for (size_t i = 0; i < padm; i += TILE_SIZE) {
         for (size_t j = 0; j < padp; j += TILE_SIZE) {
-            const size_t ic = i * padp + j;
+            task_t *task = malloc(sizeof *task);
 
-            for (size_t k = 0; k < padn; k += TILE_SIZE) {
-                const size_t ia = i * padn + k;
-                const size_t ib = j * padn + k;
+            *task = (task_t){
+                .A = A + i * padn,
+                .B = B + j * padn,
+                .C = C + i * padp + j,
+                .stride_a = padn,
+                .stride_b = padn,
+                .stride_c = padp,
+                .n_k      = padn
+            };
 
-                // The strides correspond to the number of columns in the respective matrices
-                // mm_tile(A + ia, B + ib, C + ic, padm, padp, padp);
-                task_t* task = malloc(sizeof(task_t));
-                *task = (task_t) {
-                    .A = A + ia, .B = B + ib, .C = C + ic,
-                    // .stride_a = padm, .stride_b = padp, .stride_c = padp
-                    .stride_a = padn, .stride_b = padp, .stride_c = padp
-                };
-
-                enqueue(threadpool, task);
-            }
+            enqueue(threadpool, task);
         }
     }
 
