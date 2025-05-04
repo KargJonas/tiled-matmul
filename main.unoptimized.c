@@ -3,6 +3,13 @@
 #include <string.h>
 #include <time.h>
 
+/**
+ * This implementation does uses "virtual padding", where we handle tiles at the edge of the
+ * matrix separately, and therefore dont have to actually write zeros into memory.
+ * Testing has showed me that this approach is *significantly* slower than transposing and
+ * padding with actual zeros.
+ */
+
 #define TILE_SIZE 64
 
 void print_mat(float* mat, size_t m, size_t n);

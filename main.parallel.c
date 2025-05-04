@@ -4,6 +4,10 @@
 #include <stdarg.h>
 #include <time.h>
 
+#include <stdatomic.h>
+#include <pthread.h>
+#include <unistd.h>
+
 #define TILE_SIZE 64
 #define ALIGN_UP(x) (((x) + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE)
 
@@ -14,12 +18,89 @@ static inline float* pad_mat(float* src, size_t srcr, size_t srcc, size_t padr, 
 static inline float* pad_t_mat(float* src, size_t srcr, size_t srcc, size_t padr, size_t padc);
 static inline float* unpad_mat(float* src, float* dst, size_t r, size_t c, size_t padr, size_t padc);
 
+// Allows a worker to locate a tile within A, B and C
+typedef struct task_t {
+    float *A, *B, *C;
+    size_t i, j;
+    size_t padm, padn, padp;
+} task_t;
+
+typedef struct queue_node_t {
+    task_t* tile_task;
+    struct queue_node_t *next;
+} queue_node_t;
+
+typedef struct queue_t {
+    queue_node_t *head, *tail;
+    pthread_mutex_t lock;
+    pthread_cond_t not_empty;
+} queue_t;
+
+void init_task_queue(queue_t *q) {
+    q->head = NULL;
+    q->tail = NULL;
+    pthread_mutex_init(&q->lock, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+}
+
+void enqueue(queue_t *q, task_t *task) {
+    queue_node_t *node = malloc(sizeof(queue_node_t));
+    node->tile_task = task;
+    node->next = NULL;
+
+    pthread_mutex_lock(&q->lock);
+
+    if (q->tail) q->tail->next = node;
+    else q->head = node;
+
+    q->tail = node;
+
+    pthread_cond_signal(&q->not_empty); //  Signal waiting threads
+    pthread_mutex_unlock(&q->lock);
+}
+
+
+task_t* dequeue(queue_t *q) {
+    pthread_mutex_lock(&q->lock);
+
+    while (!q->head) {
+        pthread_cond_wait(&q->not_empty, &q->lock);
+    }
+
+    queue_node_t *node = q->head;
+    task_t *task = node->tile_task;
+
+    q->head = node->next;
+    if (!q->head) q->tail = NULL;
+
+    pthread_mutex_unlock(&q->lock);
+    free(node);
+    return task;
+}
+
+
+void destroy_queue(queue_t *q) {
+    pthread_mutex_lock(&q->lock);
+    queue_node_t *curr = q->head;
+    
+    while (curr) {
+        queue_node_t *tmp = curr;
+        curr = curr->next;
+        free(tmp->tile_task);
+        free(tmp);
+    }
+
+    pthread_mutex_unlock(&q->lock);
+    pthread_mutex_destroy(&q->lock);
+    pthread_cond_destroy(&q->not_empty);
+}
+
 int main() {
     srand(314);
 
-    size_t m = 3000;
-    size_t n = 3000;
-    size_t p = 3000;
+    size_t m = 4;
+    size_t n = 4;
+    size_t p = 4;
 
     float* A = malloc(m * n * sizeof(float));
     float* B = malloc(n * p * sizeof(float));
@@ -38,14 +119,15 @@ int main() {
     float* padB = pad_t_mat(B, n, p, padn, padp);
     float* padC = calloc(padm * padp, sizeof(float));
 
-    // print_mat(A, m, n);
-    // print_mat(B, n, p);
+    print_mat(A, m, n);
+    print_mat(B, n, p);
 
     double avg = 0;
-    int iterations = 10;
+    int iterations = 1;
     for (int i = 0; i < iterations; i++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
+        // mm(A, B, C, m, n, p);
         mm(padA, padB, padC, padm, padn, padp);
         clock_gettime(CLOCK_MONOTONIC, &end);
 
@@ -58,12 +140,13 @@ int main() {
     printf("Time elapsed: %.9f seconds\n", avg);
 
     unpad_mat(padC, C, m, p, padm, padp);
+    
 
     free(padA);
     free(padB);
     free(padC);
 
-    // print_mat(C, m, p);
+    print_mat(C, m, p);
 
     free(A);
     free(B);
