@@ -39,7 +39,8 @@ int main() {
     clock_gettime(CLOCK_MONOTONIC, &end);
 
     double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    printf("Time elapsed: %.9f seconds\n", elapsed);
+    // printf("Time elapsed: %.9f seconds\n", elapsed);
+    printf("%.9f", elapsed);
 
     // print_mat(C, m, p);
 

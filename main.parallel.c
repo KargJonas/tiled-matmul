@@ -1,18 +1,27 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <time.h>
+#include <sched.h>
+#include <immintrin.h>
 
 #include <stdatomic.h>
 #include <pthread.h>
 #include <unistd.h>
 
-// #define VERBOSE
+#define VALIDATE
 
-#define TILE_SIZE 64
-#define N_CORES   12
-#define ALIGN_UP(x) (((x) + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE)
+#define TILE_SIZE       64
+#define MICRO_TILE_SIZE 8
+#define MEM_ALIGNMENT   64
+#define N_CORES         12
+
+#define ALIGN_UP_64(x) (((x) + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE)
+#define ALIGN_UP_8(x)  (((x) + MICRO_TILE_SIZE - 1) / MICRO_TILE_SIZE * MICRO_TILE_SIZE)
+#define ALIGN_UP(x)    ALIGN_UP_64(ALIGN_UP_8(x))
 
 // Allows a worker to locate a tile within A, B and C
 typedef struct task_t {
@@ -52,7 +61,7 @@ static inline __attribute__((always_inline)) void mm_tile(task_t* task);
 void fill_rand(float* arr, size_t size, size_t max);
 static inline float* pad_mat(float* src, size_t srcr, size_t srcc, size_t padr, size_t padc);
 static inline float* pad_t_mat(float* src, size_t srcr, size_t srcc, size_t padr, size_t padc);
-static inline float* unpad_mat(float* src, float* dst, size_t r, size_t c, size_t padr, size_t padc);
+static inline void unpad_mat(float* src, float* dst, size_t r, size_t c, size_t padr, size_t padc);
 
 // This function runs in each thread, listens for shutdown commands,
 // and executes tasks from the task queue.
@@ -125,10 +134,21 @@ void init_thread_pool(threadpool_t *pool, size_t num_threads) {
     
     pool->threads = (thread_info_t *)malloc(num_threads * sizeof(thread_info_t));
     
-    // Create threads
+    // Create threads and pin each one to a specific core.
     for (size_t i = 0; i < num_threads; i++) {
         pool->threads[i].active = 1;
         pthread_create(&pool->threads[i].thread, NULL, worker_thread, pool);
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(i, &cpuset);
+        int err = pthread_setaffinity_np(
+            pool->threads[i].thread,
+            sizeof(cpu_set_t),
+            &cpuset
+        );
+        if (err != 0) {
+            fprintf(stderr, "Warning: failed to pin thread %zu to core %zu: %s\n", i, i, strerror(err));
+        }
     }
 }
 
@@ -247,7 +267,7 @@ int main(int argc, char* argv[]) {
     float* padB = pad_t_mat(B, n, p, padn, padp);
     float* padC = calloc(padm * padp, sizeof(float));
 
-    #ifdef VERBOSE
+    #ifdef VALIDATE
     print_mat(A, m, n);
     print_mat(B, n, p);
     #endif
@@ -266,8 +286,10 @@ int main(int argc, char* argv[]) {
 
     avg /= iterations;
 
+    #ifndef VALIDATE
     // printf("Time elapsed: %.9f seconds\n", avg);
     printf("%.9f", avg);
+    #endif
 
     unpad_mat(padC, C, m, p, padm, padp);
     
@@ -275,7 +297,7 @@ int main(int argc, char* argv[]) {
     free(padB);
     free(padC);
 
-    #ifdef VERBOSE
+    #ifdef VALIDATE
     print_mat(C, m, p);
     #endif
 
@@ -342,10 +364,16 @@ void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t
     wait_for_completion(threadpool);
 }
 
+// Using aligned memory improved performance by a factor of 20
+void* aligned_calloc(size_t alignment, size_t num, size_t size) {
+    void* ptr = NULL;
+    if (posix_memalign(&ptr, alignment, num * size) != 0) return NULL;
+    return memset(ptr, 0, num * size);
+}
+
 // Pads a matrix up to the nearest multiple of TILE_SIZE
 static inline float* pad_mat(float* src, size_t r, size_t c, size_t padr, size_t padc) {
-    float* dst = calloc(padr * padc, sizeof(float));
-
+    float* dst = aligned_calloc(MEM_ALIGNMENT, padr * padc, sizeof(float));
     for (size_t i = 0; i < r; i++) {
         memcpy(dst + i * padc, src + i * c, c * sizeof(float));
     }
@@ -355,7 +383,7 @@ static inline float* pad_mat(float* src, size_t r, size_t c, size_t padr, size_t
 
 // Transposes a matrix and pads it up to the nearest multiple of TILE_SIZE
 static inline float* pad_t_mat(float* src, size_t r, size_t c, size_t padr, size_t padc) {
-    float* dst = calloc(padr * padc, sizeof(float));
+    float* dst = aligned_calloc(MEM_ALIGNMENT, padr * padc, sizeof(float));
 
     // Hopefully the compiler will do some heavy optimization here
     for (size_t i = 0; i < r; i++) {
@@ -367,7 +395,7 @@ static inline float* pad_t_mat(float* src, size_t r, size_t c, size_t padr, size
     return dst;
 }
 
-static inline float* unpad_mat(float* src, float* dst, size_t r, size_t c, size_t padr, size_t padc) {
+static inline void unpad_mat(float* src, float* dst, size_t r, size_t c, size_t padr, size_t padc) {
   for (size_t i = 0; i < r; i++) {
     memcpy(dst + i * c, src + i * padc, c * sizeof(float));
   }

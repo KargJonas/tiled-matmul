@@ -26,7 +26,7 @@ int parse_int(const char *str) {
 
 int main(int argc, char* argv[]) {
     srand(314);
-    // srand(time(NULL));
+    srand(time(NULL));
 
     if (argc != 4) {
         fprintf(stderr, "Error: Expected 3 arguments.");
@@ -142,10 +142,16 @@ void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p) {
     }
 }
 
+// Using aligned memory improved performance by a factor of 20
+void* aligned_calloc(size_t alignment, size_t num, size_t size) {
+    void* ptr = NULL;
+    if (posix_memalign(&ptr, alignment, num * size) != 0) return NULL;
+    return memset(ptr, 0, num * size);
+}
+
 // Pads a matrix up to the nearest multiple of TILE_SIZE
 static inline float* pad_mat(float* src, size_t r, size_t c, size_t padr, size_t padc) {
-    float* dst = calloc(padr * padc, sizeof(float));
-
+    float* dst = aligned_calloc(64, padr * padc, sizeof(float));
     for (size_t i = 0; i < r; i++) {
         memcpy(dst + i * padc, src + i * c, c * sizeof(float));
     }
@@ -155,7 +161,7 @@ static inline float* pad_mat(float* src, size_t r, size_t c, size_t padr, size_t
 
 // Transposes a matrix and pads it up to the nearest multiple of TILE_SIZE
 static inline float* pad_t_mat(float* src, size_t r, size_t c, size_t padr, size_t padc) {
-    float* dst = calloc(padr * padc, sizeof(float));
+    float* dst = aligned_calloc(64, padr * padc, sizeof(float));
 
     // Hopefully the compiler will do some heavy optimization here
     for (size_t i = 0; i < r; i++) {
