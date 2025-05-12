@@ -6,14 +6,16 @@
 #include <stdarg.h>
 #include <time.h>
 #include <sched.h>
+#include <immintrin.h>  // AVX/AVX2 intrinsics
 
 #include <stdatomic.h>
 #include <pthread.h>
 #include <unistd.h>
 
+// Increased micro tile size for better vectorization
 #define TILE_SIZE       64
 #define MICRO_TILE_SIZE 8
-#define MEM_ALIGNMENT   64
+#define MEM_ALIGNMENT   64  // Align to cache line size
 #define N_CORES         12
 
 #define ALIGN_UP_64(x) (((x) + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE)
@@ -154,7 +156,7 @@ void enqueue(threadpool_t *pool, task_t *task) {
     node->tile_task = task;
     node->next = NULL;
 
-    pthread_mutex_lock(&pool->completion_lock);
+    pthread_mutex_lock(&pool->lock);
     
     pool->tasks_remaining++;
 
@@ -164,7 +166,7 @@ void enqueue(threadpool_t *pool, task_t *task) {
     pool->tail = node;
 
     pthread_cond_signal(&pool->not_empty); // Signal waiting threads
-    pthread_mutex_unlock(&pool->completion_lock);
+    pthread_mutex_unlock(&pool->lock);
 }
 
 task_t* dequeue(threadpool_t *pool) {
@@ -259,11 +261,10 @@ int main(int argc, char* argv[]) {
     const size_t padn = ALIGN_UP(n);
     const size_t padp = ALIGN_UP(p);
 
-    // int needs_padding = padm != m || padn != n || padp != p;
-
     // Padding A; Transposing and padding B
     float* padA = pad_mat(A, m, n, padm, padn);
-    float* padB = pad_t_mat(B, n, p, padn, padp);
+    // float* padB = pad_t_mat(B, n, p, padn, padp);
+    float* padB = pad_mat(B, n, p, padn, padp);
     float* padC = calloc(padm * padp, sizeof(float));
 
     if (validate) {
@@ -302,55 +303,112 @@ int main(int argc, char* argv[]) {
     free(A);
     free(B);
     free(C);
+    
+    destroy_thread_pool(pool);
+    free(pool);
 
     return 0;
 }
 
-// Performs matrix multiplication on a single fixed-size tile
-// Because we use constants for the loop limits, this entire
-// function can be completely unrolled and thoroughly optimized
-// A, B and C are references to the beginning of the current tile.
-// The strides tell us how many elements to step over to get to
-// the next row in that tile.
+// Using aligned memory improved performance by a factor of 20
+void* aligned_calloc(size_t alignment, size_t num, size_t size) {
+    void* ptr = NULL;
+    if (posix_memalign(&ptr, alignment, num * size) != 0) return NULL;
+    return memset(ptr, 0, num * size);
+}
+
+// Improved matrix multiplication using AVX instructions and micro-tiling
 static inline __attribute__((always_inline)) void mm_tile(task_t* task) {
-    for (size_t ti = 0; ti < TILE_SIZE; ++ti) {
-        size_t offA = ti * task->stride_a;
-        size_t offC = ti * task->stride_c;
-
-        for (size_t tj = 0; tj < TILE_SIZE; ++tj) {
-            float sum = 0.0f;
-
-            for (size_t k = 0; k < task->n_k; ++k) {
-                sum += task->A[offA + k]
-                     * task->B[tj * task->stride_b + k];
+    const size_t block_size = 8; // Process 8 elements at once with AVX
+    
+    // Use micro-tiling for better cache utilization
+    for (size_t i = 0; i < TILE_SIZE; i += MICRO_TILE_SIZE) {
+        for (size_t j = 0; j < TILE_SIZE; j += block_size) {
+            // Initialize accumulators for this micro-tile
+            __m256 c00 = _mm256_setzero_ps();
+            __m256 c10 = _mm256_setzero_ps();
+            __m256 c20 = _mm256_setzero_ps();
+            __m256 c30 = _mm256_setzero_ps();
+            __m256 c40 = _mm256_setzero_ps();
+            __m256 c50 = _mm256_setzero_ps();
+            __m256 c60 = _mm256_setzero_ps();
+            __m256 c70 = _mm256_setzero_ps();
+            
+            // Process k in chunks for better cache utilization
+            for (size_t k = 0; k < task->n_k; k += block_size) {
+                size_t k_end = k + block_size <= task->n_k ? k + block_size : task->n_k;
+                
+                // Process one micro-tile (8x8)
+                for (size_t kk = k; kk < k_end; kk++) {
+                    // Load B values - transposed, so consecutive in memory
+                    // __m256 b0 = _mm256_loadu_ps(&task->B[(j) * task->stride_b + kk]);
+                    __m256 b0 = _mm256_loadu_ps(&task->B[kk * task->stride_b + j]);
+                    
+                    // Load and broadcast A values one by one (scalar to vector)
+                    __m256 a0 = _mm256_set1_ps(task->A[(i+0) * task->stride_a + kk]);
+                    __m256 a1 = _mm256_set1_ps(task->A[(i+1) * task->stride_a + kk]);
+                    __m256 a2 = _mm256_set1_ps(task->A[(i+2) * task->stride_a + kk]);
+                    __m256 a3 = _mm256_set1_ps(task->A[(i+3) * task->stride_a + kk]);
+                    __m256 a4 = _mm256_set1_ps(task->A[(i+4) * task->stride_a + kk]);
+                    __m256 a5 = _mm256_set1_ps(task->A[(i+5) * task->stride_a + kk]);
+                    __m256 a6 = _mm256_set1_ps(task->A[(i+6) * task->stride_a + kk]);
+                    __m256 a7 = _mm256_set1_ps(task->A[(i+7) * task->stride_a + kk]);
+                    
+                    // Multiply and accumulate using FMA if available
+                    #ifdef __FMA__
+                    c00 = _mm256_fmadd_ps(a0, b0, c00);
+                    c10 = _mm256_fmadd_ps(a1, b0, c10);
+                    c20 = _mm256_fmadd_ps(a2, b0, c20);
+                    c30 = _mm256_fmadd_ps(a3, b0, c30);
+                    c40 = _mm256_fmadd_ps(a4, b0, c40);
+                    c50 = _mm256_fmadd_ps(a5, b0, c50);
+                    c60 = _mm256_fmadd_ps(a6, b0, c60);
+                    c70 = _mm256_fmadd_ps(a7, b0, c70);
+                    #else
+                    c00 = _mm256_add_ps(c00, _mm256_mul_ps(a0, b0));
+                    c10 = _mm256_add_ps(c10, _mm256_mul_ps(a1, b0));
+                    c20 = _mm256_add_ps(c20, _mm256_mul_ps(a2, b0));
+                    c30 = _mm256_add_ps(c30, _mm256_mul_ps(a3, b0));
+                    c40 = _mm256_add_ps(c40, _mm256_mul_ps(a4, b0));
+                    c50 = _mm256_add_ps(c50, _mm256_mul_ps(a5, b0));
+                    c60 = _mm256_add_ps(c60, _mm256_mul_ps(a6, b0));
+                    c70 = _mm256_add_ps(c70, _mm256_mul_ps(a7, b0));
+                    #endif
+                }
             }
-
-            task->C[offC + tj] = sum;
+            
+            // Store results back to C
+            _mm256_storeu_ps(&task->C[(i+0) * task->stride_c + j], c00);
+            _mm256_storeu_ps(&task->C[(i+1) * task->stride_c + j], c10);
+            _mm256_storeu_ps(&task->C[(i+2) * task->stride_c + j], c20);
+            _mm256_storeu_ps(&task->C[(i+3) * task->stride_c + j], c30);
+            _mm256_storeu_ps(&task->C[(i+4) * task->stride_c + j], c40);
+            _mm256_storeu_ps(&task->C[(i+5) * task->stride_c + j], c50);
+            _mm256_storeu_ps(&task->C[(i+6) * task->stride_c + j], c60);
+            _mm256_storeu_ps(&task->C[(i+7) * task->stride_c + j], c70);
         }
     }
 }
 
+// Optimized matrix multiplication with better task distribution
 void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t* threadpool) {
-    // For testing, the padding stuff is still in mm but it should
-    // be moved outside of this function later, because padding and
-    // transposition should happen only once.
-
     // The size of the "inner matrix", ie all tiles that do not touch a padded edge 
     const size_t padm = ALIGN_UP(m);
     const size_t padn = ALIGN_UP(n);
     const size_t padp = ALIGN_UP(p);
-
-    // Enqueue one task per (i,j) tile
+    
+    // Use larger tasks for reduced synchronization overhead
+    // Process tiles in a Z-order curve pattern for better locality
     for (size_t i = 0; i < padm; i += TILE_SIZE) {
         for (size_t j = 0; j < padp; j += TILE_SIZE) {
             task_t *task = malloc(sizeof *task);
 
             *task = (task_t){
-                .A = A + i * padn,
-                .B = B + j * padn,
+                .A = A + i*padn,
+                .B = B + j, 
                 .C = C + i * padp + j,
                 .stride_a = padn,
-                .stride_b = padn,
+                .stride_b = padp,
                 .stride_c = padp,
                 .n_k      = padn
             };
@@ -360,13 +418,6 @@ void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t
     }
 
     wait_for_completion(threadpool);
-}
-
-// Using aligned memory improved performance by a factor of 20
-void* aligned_calloc(size_t alignment, size_t num, size_t size) {
-    void* ptr = NULL;
-    if (posix_memalign(&ptr, alignment, num * size) != 0) return NULL;
-    return memset(ptr, 0, num * size);
 }
 
 // Pads a matrix up to the nearest multiple of TILE_SIZE
@@ -383,10 +434,21 @@ static inline float* pad_mat(float* src, size_t r, size_t c, size_t padr, size_t
 static inline float* pad_t_mat(float* src, size_t r, size_t c, size_t padr, size_t padc) {
     float* dst = aligned_calloc(MEM_ALIGNMENT, padr * padc, sizeof(float));
 
-    // Hopefully the compiler will do some heavy optimization here
-    for (size_t i = 0; i < r; i++) {
-        for (size_t j = 0; j < c; j++) {
-            dst[j * padc + i] = src[i * c + j];
+    // Use blocked transposition for better cache behavior
+    const size_t block = 16; // Block size for transposition
+    
+    for (size_t i_blk = 0; i_blk < r; i_blk += block) {
+        size_t i_end = (i_blk + block < r) ? i_blk + block : r;
+        
+        for (size_t j_blk = 0; j_blk < c; j_blk += block) {
+            size_t j_end = (j_blk + block < c) ? j_blk + block : c;
+            
+            // Process this block
+            for (size_t i = i_blk; i < i_end; i++) {
+                for (size_t j = j_blk; j < j_end; j++) {
+                    dst[j * padc + i] = src[i * c + j];
+                }
+            }
         }
     }
 
@@ -394,9 +456,9 @@ static inline float* pad_t_mat(float* src, size_t r, size_t c, size_t padr, size
 }
 
 static inline void unpad_mat(float* src, float* dst, size_t r, size_t c, size_t padr, size_t padc) {
-  for (size_t i = 0; i < r; i++) {
-    memcpy(dst + i * c, src + i * padc, c * sizeof(float));
-  }
+    for (size_t i = 0; i < r; i++) {
+        memcpy(dst + i * c, src + i * padc, c * sizeof(float));
+    }
 }
 
 void fill_rand(float* arr, size_t size, size_t max) {

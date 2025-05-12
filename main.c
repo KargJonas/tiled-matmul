@@ -28,10 +28,12 @@ int main(int argc, char* argv[]) {
     srand(314);
     srand(time(NULL));
 
-    if (argc != 4) {
+    if (argc < 4) {
         fprintf(stderr, "Error: Expected 3 arguments.");
         return 1;
     }
+
+    int validate = argc == 4;
 
     size_t m = parse_int(argv[1]);
     size_t n = parse_int(argv[2]);
@@ -57,6 +59,11 @@ int main(int argc, char* argv[]) {
     // print_mat(A, m, n);
     // print_mat(B, n, p);
 
+    if (validate) {
+        print_mat(A, m, n);
+        print_mat(B, n, p);
+    }
+
     double avg = 0;
     int iterations = 1;
     for (int i = 0; i < iterations; i++) {
@@ -71,16 +78,19 @@ int main(int argc, char* argv[]) {
  
     avg /= iterations;
 
-    // printf("Time elapsed: %.9f seconds\n", avg);
-    printf("%.9f", avg);
+    if (!validate) {
+        printf("%.9f", avg);
+    }
 
     unpad_mat(padC, C, m, p, padm, padp);
-
+    
     free(padA);
     free(padB);
     free(padC);
 
-    // print_mat(C, m, p);
+    if (validate) {
+        print_mat(C, m, p);
+    }
 
     free(A);
     free(B);

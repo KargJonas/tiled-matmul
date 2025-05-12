@@ -48,7 +48,7 @@ def validate(A, B, C, tol=1e-5):
     return False, info, D
 
 def main():
-    exe = "main.parallel"
+    exe = sys.argv[1]
     for size in range(2, 129):
         print(f"Testing {size}×{size}×{size}...", flush=True)
         out = run_exec(exe, size, size, size)
@@ -57,10 +57,10 @@ def main():
         if not ok:
             print(f"\n❌ Mismatch at size {size}:")
             # dump full matrices
-            print_mat(A, "A")
-            print_mat(B, "B")
-            print_mat(C, "C (from C program)")
-            print_mat(D, "D = A @ B (Python)")
+            # print_mat(A, "A")
+            # print_mat(B, "B")
+            # print_mat(C, "C (from C program)")
+            # print_mat(D, "D = A @ B (Python)")
             # then list the individual mismatches
             print("\nFirst few differing entries:")
             for r, c, comp, exp, diff in mismatches[:10]:
