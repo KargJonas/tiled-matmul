@@ -6,16 +6,16 @@
 #include <stdarg.h>
 #include <time.h>
 #include <sched.h>
-#include <immintrin.h>  // AVX/AVX2 intrinsics
+#include <immintrin.h>
 
 #include <stdatomic.h>
 #include <pthread.h>
 #include <unistd.h>
 
-// Increased micro tile size for better vectorization
 #define TILE_SIZE       64
+#define BLOCK_SIZE      8
 #define MICRO_TILE_SIZE 8
-#define MEM_ALIGNMENT   64  // Align to cache line size
+#define MEM_ALIGNMENT   64
 #define N_CORES         12
 
 #define ALIGN_UP_64(x) (((x) + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE)
@@ -59,7 +59,6 @@ void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t
 static inline __attribute__((always_inline)) void mm_tile(task_t* task);
 void fill_rand(float* arr, size_t size, size_t max);
 static inline float* pad_mat(float* src, size_t srcr, size_t srcc, size_t padr, size_t padc);
-static inline float* pad_t_mat(float* src, size_t srcr, size_t srcc, size_t padr, size_t padc);
 static inline void unpad_mat(float* src, float* dst, size_t r, size_t c, size_t padr, size_t padc);
 
 // This function runs in each thread, listens for shutdown commands,
@@ -96,7 +95,8 @@ void* worker_thread(void* arg) {
         
         // Execute the task
         mm_tile(task);
-        free(task);        
+        free(task);
+
         // Decrement the task counter and signal if all tasks are done
         pthread_mutex_lock(&pool->completion_lock);
         pool->tasks_remaining--;
@@ -104,6 +104,7 @@ void* worker_thread(void* arg) {
         if (pool->tasks_remaining == 0) {
             pthread_cond_broadcast(&pool->all_tasks_done);
         }
+
         pthread_mutex_unlock(&pool->completion_lock);
     }
     
@@ -165,7 +166,8 @@ void enqueue(threadpool_t *pool, task_t *task) {
 
     pool->tail = node;
 
-    pthread_cond_signal(&pool->not_empty); // Signal waiting threads
+    // Signal waiting threads
+    pthread_cond_signal(&pool->not_empty);
     pthread_mutex_unlock(&pool->lock);
 }
 
@@ -191,7 +193,9 @@ void destroy_thread_pool(threadpool_t *pool) {
     // Signal shutdown
     pthread_mutex_lock(&pool->lock);
     pool->shutdown = 1;
-    pthread_cond_broadcast(&pool->not_empty); // Wake up all worker threads
+    
+    // Wake up all worker threads
+    pthread_cond_broadcast(&pool->not_empty);
     pthread_mutex_unlock(&pool->lock);
     
     // Join all threads
@@ -199,7 +203,6 @@ void destroy_thread_pool(threadpool_t *pool) {
         pthread_join(pool->threads[i].thread, NULL);
     }
     
-    // Free thread info array
     free(pool->threads);
     
     // Clean up any remaining nodes in the queue
@@ -232,8 +235,8 @@ int parse_int(const char *str) {
 }
 
 int main(int argc, char* argv[]) {
-    srand(314);
-    // srand(time(NULL));
+    // srand(314);
+    srand(time(NULL));
 
     if (argc < 4) {
         fprintf(stderr, "Error: Expected 3 arguments.");
@@ -261,9 +264,8 @@ int main(int argc, char* argv[]) {
     const size_t padn = ALIGN_UP(n);
     const size_t padp = ALIGN_UP(p);
 
-    // Padding A; Transposing and padding B
+    // Padding A and B, allocating C
     float* padA = pad_mat(A, m, n, padm, padn);
-    // float* padB = pad_t_mat(B, n, p, padn, padp);
     float* padB = pad_mat(B, n, p, padn, padp);
     float* padC = calloc(padm * padp, sizeof(float));
 
@@ -273,7 +275,7 @@ int main(int argc, char* argv[]) {
     }
 
     double avg = 0;
-    int iterations = 1;
+    int iterations = 4;
     for (int i = 0; i < iterations; i++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -291,7 +293,7 @@ int main(int argc, char* argv[]) {
     }
 
     unpad_mat(padC, C, m, p, padm, padp);
-    
+
     free(padA);
     free(padB);
     free(padC);
@@ -310,21 +312,14 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
-// Using aligned memory improved performance by a factor of 20
-void* aligned_calloc(size_t alignment, size_t num, size_t size) {
-    void* ptr = NULL;
-    if (posix_memalign(&ptr, alignment, num * size) != 0) return NULL;
-    return memset(ptr, 0, num * size);
-}
-
-// Improved matrix multiplication using AVX instructions and micro-tiling
+// Multiplies a single 64x64 tile.
+// Each 64x64 tile is broken up into 64 individual micro tiles to properly use the L1 cache.
 static inline __attribute__((always_inline)) void mm_tile(task_t* task) {
-    const size_t block_size = 8; // Process 8 elements at once with AVX
-    
-    // Use micro-tiling for better cache utilization
+
+    // Micro-tiling loop
     for (size_t i = 0; i < TILE_SIZE; i += MICRO_TILE_SIZE) {
-        for (size_t j = 0; j < TILE_SIZE; j += block_size) {
-            // Initialize accumulators for this micro-tile
+        for (size_t j = 0; j < TILE_SIZE; j += BLOCK_SIZE) {
+            // Initialize accumulators
             __m256 c00 = _mm256_setzero_ps();
             __m256 c10 = _mm256_setzero_ps();
             __m256 c20 = _mm256_setzero_ps();
@@ -334,14 +329,12 @@ static inline __attribute__((always_inline)) void mm_tile(task_t* task) {
             __m256 c60 = _mm256_setzero_ps();
             __m256 c70 = _mm256_setzero_ps();
             
-            // Process k in chunks for better cache utilization
-            for (size_t k = 0; k < task->n_k; k += block_size) {
-                size_t k_end = k + block_size <= task->n_k ? k + block_size : task->n_k;
+            // Chunked processing of k in hopes of improving cache locality
+            for (size_t k = 0; k < task->n_k; k += BLOCK_SIZE) {
+                size_t k_end = k + BLOCK_SIZE <= task->n_k ? k + BLOCK_SIZE : task->n_k;
                 
-                // Process one micro-tile (8x8)
+                // Process one 8x8 micro-tile
                 for (size_t kk = k; kk < k_end; kk++) {
-                    // Load B values - transposed, so consecutive in memory
-                    // __m256 b0 = _mm256_loadu_ps(&task->B[(j) * task->stride_b + kk]);
                     __m256 b0 = _mm256_loadu_ps(&task->B[kk * task->stride_b + j]);
                     
                     // Load and broadcast A values one by one (scalar to vector)
@@ -390,21 +383,19 @@ static inline __attribute__((always_inline)) void mm_tile(task_t* task) {
     }
 }
 
-// Optimized matrix multiplication with better task distribution
+// Multiplication of matrix A of size (m x n) with B of (n x p).
 void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t* threadpool) {
-    // The size of the "inner matrix", ie all tiles that do not touch a padded edge 
+    // Size of padded matrix
     const size_t padm = ALIGN_UP(m);
     const size_t padn = ALIGN_UP(n);
     const size_t padp = ALIGN_UP(p);
     
-    // Use larger tasks for reduced synchronization overhead
-    // Process tiles in a Z-order curve pattern for better locality
     for (size_t i = 0; i < padm; i += TILE_SIZE) {
         for (size_t j = 0; j < padp; j += TILE_SIZE) {
             task_t *task = malloc(sizeof *task);
 
             *task = (task_t){
-                .A = A + i*padn,
+                .A = A + i * padn,
                 .B = B + j, 
                 .C = C + i * padp + j,
                 .stride_a = padn,
@@ -420,36 +411,17 @@ void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t
     wait_for_completion(threadpool);
 }
 
+void* aligned_calloc(size_t alignment, size_t num, size_t size) {
+    void* ptr = NULL;
+    if (posix_memalign(&ptr, alignment, num * size) != 0) return NULL;
+    return memset(ptr, 0, num * size);
+}
+
 // Pads a matrix up to the nearest multiple of TILE_SIZE
 static inline float* pad_mat(float* src, size_t r, size_t c, size_t padr, size_t padc) {
     float* dst = aligned_calloc(MEM_ALIGNMENT, padr * padc, sizeof(float));
     for (size_t i = 0; i < r; i++) {
         memcpy(dst + i * padc, src + i * c, c * sizeof(float));
-    }
-
-    return dst;
-}
-
-// Transposes a matrix and pads it up to the nearest multiple of TILE_SIZE
-static inline float* pad_t_mat(float* src, size_t r, size_t c, size_t padr, size_t padc) {
-    float* dst = aligned_calloc(MEM_ALIGNMENT, padr * padc, sizeof(float));
-
-    // Use blocked transposition for better cache behavior
-    const size_t block = 16; // Block size for transposition
-    
-    for (size_t i_blk = 0; i_blk < r; i_blk += block) {
-        size_t i_end = (i_blk + block < r) ? i_blk + block : r;
-        
-        for (size_t j_blk = 0; j_blk < c; j_blk += block) {
-            size_t j_end = (j_blk + block < c) ? j_blk + block : c;
-            
-            // Process this block
-            for (size_t i = i_blk; i < i_end; i++) {
-                for (size_t j = j_blk; j < j_end; j++) {
-                    dst[j * padc + i] = src[i * c + j];
-                }
-            }
-        }
     }
 
     return dst;

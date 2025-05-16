@@ -12,6 +12,6 @@ def run_exec(exe, m, n, p):
     return float(cp.stdout)
 
 for i in range(50, 3000, 50):
-    main = run_exec(a, i, i, i,)
-    parallel = run_exec(b, i, i, i)
-    print(f"{i}: {main / parallel}")
+    old = run_exec(a, i, i, i,)
+    new = run_exec(b, i, i, i)
+    print(f"{i}: {old / new}")

@@ -1,16 +1,25 @@
-CC       = gcc
-CFLAGS   = -Ofast -funroll-loops -march=native -mtune=native -mfma -mavx2 -ffast-math -fopt-info-vec-optimized
+CC      := gcc
+CFLAGS  := -Ofast -funroll-loops -pthread -march=native -mtune=native -mfma -mavx2 -ffast-math -fopt-info-vec-optimized
 
-SRCS     = $(wildcard *.c)
-BINS     = $(SRCS:.c=)
+OUTDIR  := bin
 
-all: $(BINS)
-.DEFAULT_GOAL := all
+SRCS    := $(wildcard *.c) $(wildcard *.cpp)
+BINS    := $(SRCS:%.c=$(OUTDIR)/%) $(SRCS:%.cpp=$(OUTDIR)/%)
 
-%: %.c
+.PHONY: all clean
+
+all: | $(OUTDIR) $(BINS)
+
+$(OUTDIR):
+	mkdir -p $@
+
+$(OUTDIR)/%: %.c
+	$(CC) $(CFLAGS) $< -o $@
+
+$(OUTDIR)/%: %.cpp
 	$(CC) $(CFLAGS) $< -o $@
 
 clean:
-	rm -f $(BINS)
+	rm -rf $(OUTDIR)
 
-.PHONY: clean
+.DEFAULT_GOAL := all

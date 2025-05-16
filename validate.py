@@ -49,7 +49,7 @@ def validate(A, B, C, tol=1e-5):
 
 def main():
     exe = sys.argv[1]
-    for size in range(2, 129):
+    for size in range(2, 1025):
         print(f"Testing {size}×{size}×{size}...", flush=True)
         out = run_exec(exe, size, size, size)
         A, B, C = parse_matrices(out)
