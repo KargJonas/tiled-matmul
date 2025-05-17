@@ -15,6 +15,7 @@
 #define TILE_SIZE       64
 #define BLOCK_SIZE      8
 #define MICRO_TILE_SIZE 8
+#define K_STEP          1024
 #define MEM_ALIGNMENT   64
 #define N_CORES         12
 
@@ -66,6 +67,9 @@ static inline void unpad_mat(float* src, float* dst, size_t r, size_t c, size_t 
 void* worker_thread(void* arg) {
     threadpool_t *pool = (threadpool_t *)arg;
     
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
     while (1) {
         task_t *task = NULL;
         
@@ -79,7 +83,7 @@ void* worker_thread(void* arg) {
         // Check if we need to shutdown
         if (pool->shutdown) {
             pthread_mutex_unlock(&pool->lock);
-            pthread_exit(NULL);
+            break;
         }
         
         // Dequeue a task
@@ -107,7 +111,11 @@ void* worker_thread(void* arg) {
 
         pthread_mutex_unlock(&pool->completion_lock);
     }
-    
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6;
+    printf("Thread done after %f ms\n", elapsed);
+
     return NULL;
 }
 
@@ -251,9 +259,6 @@ int main(int argc, char* argv[]) {
     size_t n = parse_int(argv[2]);
     size_t p = parse_int(argv[3]);
 
-    threadpool_t *pool = malloc(sizeof(threadpool_t));
-    init_thread_pool(pool, N_CORES);
-
     float* A = malloc(m * n * sizeof(float));
     float* B = malloc(n * p * sizeof(float));
     float* C = malloc(m * p * sizeof(float));
@@ -276,8 +281,11 @@ int main(int argc, char* argv[]) {
         print_mat(B, n, p);
     }
 
+    threadpool_t *pool = malloc(sizeof(threadpool_t));
+    init_thread_pool(pool, N_CORES);
+
     double avg = 0;
-    int iterations = 16;
+    int iterations = 1;
     for (int i = 0; i < iterations; i++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -287,6 +295,9 @@ int main(int argc, char* argv[]) {
         double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         avg += elapsed;
     }
+
+    destroy_thread_pool(pool);
+    free(pool);
 
     avg /= iterations;
 
@@ -307,9 +318,6 @@ int main(int argc, char* argv[]) {
     free(A);
     free(B);
     free(C);
-    
-    destroy_thread_pool(pool);
-    free(pool);
 
     return 0;
 }
@@ -385,32 +393,35 @@ static inline __attribute__((always_inline)) void mm_tile(task_t* task) {
     }
 }
 
-// Multiplication of matrix A of size (m x n) with B of (n x p).
-void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t* threadpool) {
-    // Size of padded matrix
+void mm(float *A, float *B, float *C, size_t m, size_t n, size_t p, threadpool_t *threadpool) {
     const size_t padm = ALIGN_UP(m);
     const size_t padn = ALIGN_UP(n);
     const size_t padp = ALIGN_UP(p);
-    
-    for (size_t i = 0; i < padm; i += TILE_SIZE) {
-        for (size_t j = 0; j < padp; j += TILE_SIZE) {
-            task_t *task = malloc(sizeof *task);
 
-            *task = (task_t){
-                .A = A + i * padn,
-                .B = B + j, 
-                .C = C + i * padp + j,
-                .stride_a = padn,
-                .stride_b = padp,
-                .stride_c = padp,
-                .n_k      = padn
-            };
+    for (size_t kk = 0; kk < padn; kk += K_STEP) {
+        size_t cur_k = (kk + K_STEP <= padn) ? K_STEP : (padn - kk);
 
-            enqueue(threadpool, task);
+        for (size_t i = 0; i < padm; i += TILE_SIZE) {
+            for (size_t j = 0; j < padp; j += TILE_SIZE) {
+
+                task_t *task = malloc(sizeof *task);
+                *task = (task_t){
+                    .A = A + i * padn + kk,
+                    .B = B + kk * padp + j,
+                    .C = C + i * padp + j,
+
+                    .stride_a = padn,
+                    .stride_b = padp,
+                    .stride_c = padp,
+                    .n_k      = cur_k
+                };
+
+                enqueue(threadpool, task);
+            }
         }
-    }
 
-    wait_for_completion(threadpool);
+        wait_for_completion(threadpool);
+    }
 }
 
 void* aligned_calloc(size_t alignment, size_t num, size_t size) {

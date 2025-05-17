@@ -13,10 +13,10 @@
 #include <unistd.h>
 
 #define TILE_SIZE       64
-#define BLOCK_SIZE      8
+#define BLOCK_SIZE      16
 #define MICRO_TILE_SIZE 8
 #define MEM_ALIGNMENT   64
-#define N_CORES         12
+#define N_CORES         10
 
 #define ALIGN_UP_64(x) (((x) + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE)
 #define ALIGN_UP_8(x)  (((x) + MICRO_TILE_SIZE - 1) / MICRO_TILE_SIZE * MICRO_TILE_SIZE)
@@ -169,7 +169,8 @@ void enqueue(threadpool_t *pool, task_t *task) {
     pool->tail = node;
 
     // Signal waiting threads
-    pthread_cond_signal(&pool->not_empty);
+    // pthread_cond_signal(&pool->not_empty);
+    pthread_cond_broadcast(&pool->not_empty);
     pthread_mutex_unlock(&pool->lock);
 }
 
@@ -316,74 +317,123 @@ int main(int argc, char* argv[]) {
 
 // Multiplies a single 64x64 tile.
 // Each 64x64 tile is broken up into 64 individual micro tiles to properly use the L1 cache.
+// Multiplies a single 64x64 tile using 16x16 micro-tiles.
 static inline __attribute__((always_inline)) void mm_tile(task_t* task) {
 
-    // Micro-tiling loop
-    for (size_t i = 0; i < TILE_SIZE; i += MICRO_TILE_SIZE) {
-        for (size_t j = 0; j < TILE_SIZE; j += BLOCK_SIZE) {
-            // Initialize accumulators
-            __m256 c00 = _mm256_setzero_ps();
-            __m256 c10 = _mm256_setzero_ps();
-            __m256 c20 = _mm256_setzero_ps();
-            __m256 c30 = _mm256_setzero_ps();
-            __m256 c40 = _mm256_setzero_ps();
-            __m256 c50 = _mm256_setzero_ps();
-            __m256 c60 = _mm256_setzero_ps();
-            __m256 c70 = _mm256_setzero_ps();
+    for (size_t i = 0; i < TILE_SIZE; i += 16) {
+        for (size_t j = 0; j < TILE_SIZE; j += 16) {
+            // Initialize accumulators for 16 rows × 2 vectors per row (for 16 cols)
+            __m256 c[16][2];
             
-            // Chunked processing of k in hopes of improving cache locality
+            for (int r = 0; r < 16; ++r) {
+    c[r][0] = _mm256_loadu_ps(&task->C[(i + r)*task->stride_c + j]);
+    c[r][1] = _mm256_loadu_ps(&task->C[(i + r)*task->stride_c + j + 8]);
+}
+            // for (int r = 0; r < 16; ++r) {
+            //     c[r][0] = _mm256_setzero_ps(); // First 8 columns
+            //     c[r][1] = _mm256_setzero_ps(); // Second 8 columns
+            // }
+
             for (size_t k = 0; k < task->n_k; k += BLOCK_SIZE) {
                 size_t k_end = k + BLOCK_SIZE <= task->n_k ? k + BLOCK_SIZE : task->n_k;
-                
-                // Process one 8x8 micro-tile
+
                 for (size_t kk = k; kk < k_end; kk++) {
+                    // Load 16 elements from B row-wise
                     __m256 b0 = _mm256_loadu_ps(&task->B[kk * task->stride_b + j]);
-                    
-                    // Load and broadcast A values one by one (scalar to vector)
-                    __m256 a0 = _mm256_set1_ps(task->A[(i+0) * task->stride_a + kk]);
-                    __m256 a1 = _mm256_set1_ps(task->A[(i+1) * task->stride_a + kk]);
-                    __m256 a2 = _mm256_set1_ps(task->A[(i+2) * task->stride_a + kk]);
-                    __m256 a3 = _mm256_set1_ps(task->A[(i+3) * task->stride_a + kk]);
-                    __m256 a4 = _mm256_set1_ps(task->A[(i+4) * task->stride_a + kk]);
-                    __m256 a5 = _mm256_set1_ps(task->A[(i+5) * task->stride_a + kk]);
-                    __m256 a6 = _mm256_set1_ps(task->A[(i+6) * task->stride_a + kk]);
-                    __m256 a7 = _mm256_set1_ps(task->A[(i+7) * task->stride_a + kk]);
-                    
-                    // Multiply and accumulate using FMA if available
-                    #ifdef __FMA__
-                    c00 = _mm256_fmadd_ps(a0, b0, c00);
-                    c10 = _mm256_fmadd_ps(a1, b0, c10);
-                    c20 = _mm256_fmadd_ps(a2, b0, c20);
-                    c30 = _mm256_fmadd_ps(a3, b0, c30);
-                    c40 = _mm256_fmadd_ps(a4, b0, c40);
-                    c50 = _mm256_fmadd_ps(a5, b0, c50);
-                    c60 = _mm256_fmadd_ps(a6, b0, c60);
-                    c70 = _mm256_fmadd_ps(a7, b0, c70);
-                    #else
-                    c00 = _mm256_add_ps(c00, _mm256_mul_ps(a0, b0));
-                    c10 = _mm256_add_ps(c10, _mm256_mul_ps(a1, b0));
-                    c20 = _mm256_add_ps(c20, _mm256_mul_ps(a2, b0));
-                    c30 = _mm256_add_ps(c30, _mm256_mul_ps(a3, b0));
-                    c40 = _mm256_add_ps(c40, _mm256_mul_ps(a4, b0));
-                    c50 = _mm256_add_ps(c50, _mm256_mul_ps(a5, b0));
-                    c60 = _mm256_add_ps(c60, _mm256_mul_ps(a6, b0));
-                    c70 = _mm256_add_ps(c70, _mm256_mul_ps(a7, b0));
-                    #endif
+                    __m256 b1 = _mm256_loadu_ps(&task->B[kk * task->stride_b + j + 8]);
+
+                    for (int r = 0; r < 16; ++r) {
+                        __m256 a = _mm256_set1_ps(task->A[(i + r) * task->stride_a + kk]);
+
+                        #ifdef __FMA__
+                        c[r][0] = _mm256_fmadd_ps(a, b0, c[r][0]);
+                        c[r][1] = _mm256_fmadd_ps(a, b1, c[r][1]);
+                        #else
+                        c[r][0] = _mm256_add_ps(c[r][0], _mm256_mul_ps(a, b0));
+                        c[r][1] = _mm256_add_ps(c[r][1], _mm256_mul_ps(a, b1));
+                        #endif
+                    }
                 }
             }
-            
-            // Store results back to C
-            _mm256_storeu_ps(&task->C[(i+0) * task->stride_c + j], c00);
-            _mm256_storeu_ps(&task->C[(i+1) * task->stride_c + j], c10);
-            _mm256_storeu_ps(&task->C[(i+2) * task->stride_c + j], c20);
-            _mm256_storeu_ps(&task->C[(i+3) * task->stride_c + j], c30);
-            _mm256_storeu_ps(&task->C[(i+4) * task->stride_c + j], c40);
-            _mm256_storeu_ps(&task->C[(i+5) * task->stride_c + j], c50);
-            _mm256_storeu_ps(&task->C[(i+6) * task->stride_c + j], c60);
-            _mm256_storeu_ps(&task->C[(i+7) * task->stride_c + j], c70);
+
+            // Store results
+            for (int r = 0; r < 16; ++r) {
+                _mm256_storeu_ps(&task->C[(i + r) * task->stride_c + j],     c[r][0]);
+                _mm256_storeu_ps(&task->C[(i + r) * task->stride_c + j + 8], c[r][1]);
+            }
         }
     }
 }
+
+
+// static inline __attribute__((always_inline)) void mm_tile(task_t* task) {
+
+//     // Micro-tiling loop
+//     for (size_t i = 0; i < TILE_SIZE; i += MICRO_TILE_SIZE) {
+//         for (size_t j = 0; j < TILE_SIZE; j += MICRO_TILE_SIZE) {
+//             // Initialize accumulators
+//             __m256 c00 = _mm256_setzero_ps();
+//             __m256 c10 = _mm256_setzero_ps();
+//             __m256 c20 = _mm256_setzero_ps();
+//             __m256 c30 = _mm256_setzero_ps();
+//             __m256 c40 = _mm256_setzero_ps();
+//             __m256 c50 = _mm256_setzero_ps();
+//             __m256 c60 = _mm256_setzero_ps();
+//             __m256 c70 = _mm256_setzero_ps();
+            
+//             // Chunked processing of k in hopes of improving cache locality
+//             for (size_t k = 0; k < task->n_k; k += BLOCK_SIZE) {
+//                 size_t k_end = k + BLOCK_SIZE <= task->n_k ? k + BLOCK_SIZE : task->n_k;
+                
+//                 // Process one 8x8 micro-tile
+//                 for (size_t kk = k; kk < k_end; kk++) {
+//                     __m256 b0 = _mm256_loadu_ps(&task->B[kk * task->stride_b + j]);
+                    
+//                     // Load and broadcast A values one by one (scalar to vector)
+//                     __m256 a0 = _mm256_set1_ps(task->A[(i+0) * task->stride_a + kk]);
+//                     __m256 a1 = _mm256_set1_ps(task->A[(i+1) * task->stride_a + kk]);
+//                     __m256 a2 = _mm256_set1_ps(task->A[(i+2) * task->stride_a + kk]);
+//                     __m256 a3 = _mm256_set1_ps(task->A[(i+3) * task->stride_a + kk]);
+//                     __m256 a4 = _mm256_set1_ps(task->A[(i+4) * task->stride_a + kk]);
+//                     __m256 a5 = _mm256_set1_ps(task->A[(i+5) * task->stride_a + kk]);
+//                     __m256 a6 = _mm256_set1_ps(task->A[(i+6) * task->stride_a + kk]);
+//                     __m256 a7 = _mm256_set1_ps(task->A[(i+7) * task->stride_a + kk]);
+                    
+//                     // Multiply and accumulate using FMA if available
+//                     #ifdef __FMA__
+//                     c00 = _mm256_fmadd_ps(a0, b0, c00);
+//                     c10 = _mm256_fmadd_ps(a1, b0, c10);
+//                     c20 = _mm256_fmadd_ps(a2, b0, c20);
+//                     c30 = _mm256_fmadd_ps(a3, b0, c30);
+//                     c40 = _mm256_fmadd_ps(a4, b0, c40);
+//                     c50 = _mm256_fmadd_ps(a5, b0, c50);
+//                     c60 = _mm256_fmadd_ps(a6, b0, c60);
+//                     c70 = _mm256_fmadd_ps(a7, b0, c70);
+//                     #else
+//                     c00 = _mm256_add_ps(c00, _mm256_mul_ps(a0, b0));
+//                     c10 = _mm256_add_ps(c10, _mm256_mul_ps(a1, b0));
+//                     c20 = _mm256_add_ps(c20, _mm256_mul_ps(a2, b0));
+//                     c30 = _mm256_add_ps(c30, _mm256_mul_ps(a3, b0));
+//                     c40 = _mm256_add_ps(c40, _mm256_mul_ps(a4, b0));
+//                     c50 = _mm256_add_ps(c50, _mm256_mul_ps(a5, b0));
+//                     c60 = _mm256_add_ps(c60, _mm256_mul_ps(a6, b0));
+//                     c70 = _mm256_add_ps(c70, _mm256_mul_ps(a7, b0));
+//                     #endif
+//                 }
+//             }
+            
+//             // Store results back to C
+//             _mm256_storeu_ps(&task->C[(i+0) * task->stride_c + j], c00);
+//             _mm256_storeu_ps(&task->C[(i+1) * task->stride_c + j], c10);
+//             _mm256_storeu_ps(&task->C[(i+2) * task->stride_c + j], c20);
+//             _mm256_storeu_ps(&task->C[(i+3) * task->stride_c + j], c30);
+//             _mm256_storeu_ps(&task->C[(i+4) * task->stride_c + j], c40);
+//             _mm256_storeu_ps(&task->C[(i+5) * task->stride_c + j], c50);
+//             _mm256_storeu_ps(&task->C[(i+6) * task->stride_c + j], c60);
+//             _mm256_storeu_ps(&task->C[(i+7) * task->stride_c + j], c70);
+//         }
+//     }
+// }
 
 // Multiplication of matrix A of size (m x n) with B of (n x p).
 void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t* threadpool) {

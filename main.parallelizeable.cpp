@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,10 +5,6 @@
 #include <time.h>
 #include <sched.h>
 #include <immintrin.h>
-
-#include <stdatomic.h>
-#include <pthread.h>
-#include <unistd.h>
 
 #define TILE_SIZE       64
 #define BLOCK_SIZE      8
@@ -55,176 +49,11 @@ typedef struct threadpool_t {
 } threadpool_t;
 
 void print_mat(float* mat, size_t m, size_t n);
-void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t* threadpool);
+void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p);
 static inline __attribute__((always_inline)) void mm_tile(task_t* task);
 void fill_rand(float* arr, size_t size, size_t max);
 static inline float* pad_mat(float* src, size_t srcr, size_t srcc, size_t padr, size_t padc);
 static inline void unpad_mat(float* src, float* dst, size_t r, size_t c, size_t padr, size_t padc);
-
-// This function runs in each thread, listens for shutdown commands,
-// and executes tasks from the task queue.
-void* worker_thread(void* arg) {
-    threadpool_t *pool = (threadpool_t *)arg;
-    
-    while (1) {
-        task_t *task = NULL;
-        
-        pthread_mutex_lock(&pool->lock);
-        
-        // Wait until there's a task or shutdown is signaled
-        while (!pool->head && !pool->shutdown) {
-            pthread_cond_wait(&pool->not_empty, &pool->lock);
-        }
-        
-        // Check if we need to shutdown
-        if (pool->shutdown) {
-            pthread_mutex_unlock(&pool->lock);
-            pthread_exit(NULL);
-        }
-        
-        // Dequeue a task
-        queue_node_t *node = pool->head;
-        task = node->tile_task;
-        pool->head = node->next;
-        if (!pool->head) pool->tail = NULL;
-        
-        // Signal that the queue is not full
-        pthread_cond_signal(&pool->not_full);
-        pthread_mutex_unlock(&pool->lock);
-        free(node);
-        
-        // Execute the task
-        mm_tile(task);
-        free(task);
-
-        // Decrement the task counter and signal if all tasks are done
-        pthread_mutex_lock(&pool->completion_lock);
-        pool->tasks_remaining--;
-        
-        if (pool->tasks_remaining == 0) {
-            pthread_cond_broadcast(&pool->all_tasks_done);
-        }
-
-        pthread_mutex_unlock(&pool->completion_lock);
-    }
-    
-    return NULL;
-}
-
-void wait_for_completion(threadpool_t *pool) {
-    pthread_mutex_lock(&pool->completion_lock);
-    while (pool->tasks_remaining > 0) {
-        pthread_cond_wait(&pool->all_tasks_done, &pool->completion_lock);
-    }
-    pthread_mutex_unlock(&pool->completion_lock);
-}
-
-void init_thread_pool(threadpool_t *pool, size_t num_threads) {
-    pool->head = NULL;
-    pool->tail = NULL;
-    pool->shutdown = 0;
-    pool->num_threads = num_threads;
-    pool->tasks_remaining = 0;
-    
-    pthread_mutex_init(&pool->lock, NULL);
-    pthread_cond_init(&pool->not_empty, NULL);
-    pthread_cond_init(&pool->not_full, NULL);
-    pthread_mutex_init(&pool->completion_lock, NULL);
-    pthread_cond_init(&pool->all_tasks_done, NULL);
-    
-    pool->threads = (thread_info_t*)malloc(num_threads * sizeof(thread_info_t));
-    
-    // Create threads and pin each one to a specific core.
-    for (size_t i = 0; i < num_threads; i++) {
-        pool->threads[i].active = 1;
-        pthread_create(&pool->threads[i].thread, NULL, worker_thread, pool);
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(i, &cpuset);
-        int err = pthread_setaffinity_np(
-            pool->threads[i].thread,
-            sizeof(cpu_set_t),
-            &cpuset
-        );
-        if (err != 0) {
-            fprintf(stderr, "Warning: failed to pin thread %zu to core %zu: %s\n", i, i, strerror(err));
-        }
-    }
-}
-
-void enqueue(threadpool_t *pool, task_t *task) {
-    queue_node_t *node = malloc(sizeof(queue_node_t));
-    node->tile_task = task;
-    node->next = NULL;
-
-    pthread_mutex_lock(&pool->lock);
-    
-    pthread_mutex_lock(&pool->completion_lock);
-    pool->tasks_remaining++;
-    pthread_mutex_unlock(&pool->completion_lock);
-
-    if (pool->tail) pool->tail->next = node;
-    else pool->head = node;
-
-    pool->tail = node;
-
-    // Signal waiting threads
-    pthread_cond_signal(&pool->not_empty);
-    pthread_mutex_unlock(&pool->lock);
-}
-
-task_t* dequeue(threadpool_t *pool) {
-    pthread_mutex_lock(&pool->lock);
-
-    while (!pool->head) {
-        pthread_cond_wait(&pool->not_empty, &pool->lock);
-    }
-
-    queue_node_t *node = pool->head;
-    task_t *task = node->tile_task;
-
-    pool->head = node->next;
-    if (!pool->head) pool->tail = NULL;
-
-    pthread_mutex_unlock(&pool->lock);
-    free(node);
-    return task;
-}
-
-void destroy_thread_pool(threadpool_t *pool) {
-    // Signal shutdown
-    pthread_mutex_lock(&pool->lock);
-    pool->shutdown = 1;
-    
-    // Wake up all worker threads
-    pthread_cond_broadcast(&pool->not_empty);
-    pthread_mutex_unlock(&pool->lock);
-    
-    // Join all threads
-    for (size_t i = 0; i < pool->num_threads; i++) {
-        pthread_join(pool->threads[i].thread, NULL);
-    }
-    
-    free(pool->threads);
-    
-    // Clean up any remaining nodes in the queue
-    pthread_mutex_lock(&pool->lock);
-    queue_node_t *curr = pool->head;
-
-    while (curr) {
-        queue_node_t *tmp = curr;
-        curr = curr->next;
-        free(tmp->tile_task);
-        free(tmp);
-    }
-
-    pthread_mutex_unlock(&pool->lock);
-    pthread_mutex_destroy(&pool->lock);
-    pthread_cond_destroy(&pool->not_empty);
-    pthread_cond_destroy(&pool->not_full);
-    pthread_mutex_destroy(&pool->completion_lock);
-    pthread_cond_destroy(&pool->all_tasks_done);
-}
 
 int parse_int(const char *str) {
     char *end;
@@ -251,12 +80,9 @@ int main(int argc, char* argv[]) {
     size_t n = parse_int(argv[2]);
     size_t p = parse_int(argv[3]);
 
-    threadpool_t *pool = malloc(sizeof(threadpool_t));
-    init_thread_pool(pool, N_CORES);
-
-    float* A = malloc(m * n * sizeof(float));
-    float* B = malloc(n * p * sizeof(float));
-    float* C = malloc(m * p * sizeof(float));
+    float* A = (float*)malloc(m * n * sizeof(float));
+    float* B = (float*)malloc(n * p * sizeof(float));
+    float* C = (float*)malloc(m * p * sizeof(float));
 
     fill_rand(A, m * n, 10);
     fill_rand(B, n * p, 10);
@@ -269,7 +95,7 @@ int main(int argc, char* argv[]) {
     // Padding A and B, allocating C
     float* padA = pad_mat(A, m, n, padm, padn);
     float* padB = pad_mat(B, n, p, padn, padp);
-    float* padC = calloc(padm * padp, sizeof(float));
+    float* padC = (float*)calloc(padm * padp, sizeof(float));
 
     if (validate) {
         print_mat(A, m, n);
@@ -277,11 +103,11 @@ int main(int argc, char* argv[]) {
     }
 
     double avg = 0;
-    int iterations = 16;
+    int iterations = 4;
     for (int i = 0; i < iterations; i++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        mm(padA, padB, padC, padm, padn, padp, pool);
+        mm(padA, padB, padC, padm, padn, padp);
         clock_gettime(CLOCK_MONOTONIC, &end);
 
         double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -308,9 +134,6 @@ int main(int argc, char* argv[]) {
     free(B);
     free(C);
     
-    destroy_thread_pool(pool);
-    free(pool);
-
     return 0;
 }
 
@@ -386,7 +209,7 @@ static inline __attribute__((always_inline)) void mm_tile(task_t* task) {
 }
 
 // Multiplication of matrix A of size (m x n) with B of (n x p).
-void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t* threadpool) {
+void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p) {
     // Size of padded matrix
     const size_t padm = ALIGN_UP(m);
     const size_t padn = ALIGN_UP(n);
@@ -394,7 +217,7 @@ void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t
     
     for (size_t i = 0; i < padm; i += TILE_SIZE) {
         for (size_t j = 0; j < padp; j += TILE_SIZE) {
-            task_t *task = malloc(sizeof *task);
+            task_t* task = (task_t*)malloc(sizeof *task);
 
             *task = (task_t){
                 .A = A + i * padn,
@@ -406,11 +229,9 @@ void mm(float* A, float* B, float* C, size_t m, size_t n, size_t p, threadpool_t
                 .n_k      = padn
             };
 
-            enqueue(threadpool, task);
+            mm_tile(task);
         }
     }
-
-    wait_for_completion(threadpool);
 }
 
 void* aligned_calloc(size_t alignment, size_t num, size_t size) {
@@ -421,11 +242,10 @@ void* aligned_calloc(size_t alignment, size_t num, size_t size) {
 
 // Pads a matrix up to the nearest multiple of TILE_SIZE
 static inline float* pad_mat(float* src, size_t r, size_t c, size_t padr, size_t padc) {
-    float* dst = aligned_calloc(MEM_ALIGNMENT, padr * padc, sizeof(float));
+    float* dst = (float*)aligned_calloc(MEM_ALIGNMENT, padr * padc, sizeof(float));
     for (size_t i = 0; i < r; i++) {
         memcpy(dst + i * padc, src + i * c, c * sizeof(float));
     }
-
     return dst;
 }
 

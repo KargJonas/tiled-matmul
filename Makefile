@@ -1,5 +1,7 @@
-CC      := gcc
-CFLAGS  := -Ofast -funroll-loops -pthread -march=native -mtune=native -mfma -mavx2 -ffast-math -fopt-info-vec-optimized
+CC      	:= gcc
+CPP     	:= g++
+CFLAGS  	:= -Ofast -funroll-loops -pthread -march=native -mtune=native -mfma -mavx2 -ffast-math -fopt-info-vec-optimized
+CPPFLAGS	:= -Ofast -funroll-loops -pthread -march=native -mtune=native -mfma -mavx2 -ffast-math -fopt-info-vec-optimized -I taskflow/
 
 OUTDIR  := bin
 
@@ -17,7 +19,7 @@ $(OUTDIR)/%: %.c
 	$(CC) $(CFLAGS) $< -o $@
 
 $(OUTDIR)/%: %.cpp
-	$(CC) $(CFLAGS) $< -o $@
+	$(CPP) $(CPPFLAGS) $< -o $@
 
 clean:
 	rm -rf $(OUTDIR)
