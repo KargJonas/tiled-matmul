@@ -1,7 +1,4 @@
-*
-!*.c
-!*.cpp
-!Makefile
-!*.py
-!*.sh
-!.gitignore
+bin
+.vscode
+.venv
+__pycache__
