@@ -46,7 +46,6 @@ typedef struct threadpool_t {
     queue_node_t *head, *tail;          // Task queue
     pthread_mutex_t lock;               // Mutex for queue access
     pthread_cond_t not_empty;           // Condition variable for queue not empty
-    pthread_cond_t not_full;            // Condition variable for queue not full
     thread_info_t *threads;             // Array of thread information
     size_t num_threads;                 // Number of threads in the pool
     int shutdown;                       // Flag to indicate shutdown
@@ -67,8 +66,8 @@ static inline void unpad_mat(float* src, float* dst, size_t r, size_t c, size_t 
 void* worker_thread(void* arg) {
     threadpool_t *pool = (threadpool_t *)arg;
     
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    // struct timespec start, end;
+    // clock_gettime(CLOCK_MONOTONIC, &start);
 
     while (1) {
         task_t *task = NULL;
@@ -92,8 +91,6 @@ void* worker_thread(void* arg) {
         pool->head = node->next;
         if (!pool->head) pool->tail = NULL;
         
-        // Signal that the queue is not full
-        pthread_cond_signal(&pool->not_full);
         pthread_mutex_unlock(&pool->lock);
         free(node);
         
@@ -112,9 +109,9 @@ void* worker_thread(void* arg) {
         pthread_mutex_unlock(&pool->completion_lock);
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double elapsed = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6;
-    printf("Thread done after %f ms\n", elapsed);
+    // clock_gettime(CLOCK_MONOTONIC, &end);
+    // double elapsed = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6;
+    // printf("Thread done after %f ms\n", elapsed);
 
     return NULL;
 }
@@ -136,7 +133,6 @@ void init_thread_pool(threadpool_t *pool, size_t num_threads) {
     
     pthread_mutex_init(&pool->lock, NULL);
     pthread_cond_init(&pool->not_empty, NULL);
-    pthread_cond_init(&pool->not_full, NULL);
     pthread_mutex_init(&pool->completion_lock, NULL);
     pthread_cond_init(&pool->all_tasks_done, NULL);
     
@@ -229,7 +225,6 @@ void destroy_thread_pool(threadpool_t *pool) {
     pthread_mutex_unlock(&pool->lock);
     pthread_mutex_destroy(&pool->lock);
     pthread_cond_destroy(&pool->not_empty);
-    pthread_cond_destroy(&pool->not_full);
     pthread_mutex_destroy(&pool->completion_lock);
     pthread_cond_destroy(&pool->all_tasks_done);
 }
@@ -285,7 +280,7 @@ int main(int argc, char* argv[]) {
     init_thread_pool(pool, N_CORES);
 
     double avg = 0;
-    int iterations = 1;
+    int iterations = 10;
     for (int i = 0; i < iterations; i++) {
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
